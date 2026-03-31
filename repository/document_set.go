@@ -784,6 +784,9 @@ func (ds *documentSet) AddDocument(
 		// changes.
 		for incUUID, didLoadDoc := range previous.IncludeRefs {
 			incRef := ds.included[incUUID]
+			if incRef == nil {
+				continue
+			}
 
 			included, loadDoc := setDoc.IncludedDocument(incUUID)
 
@@ -818,12 +821,17 @@ func (ds *documentSet) RemoveDocument(docUUID uuid.UUID) []inclusionChange {
 		return nil
 	}
 
+	delete(ds.set, docUUID)
+
 	var changed []inclusionChange
 
 	// Update the document set reference counters with negative
 	// changes.
 	for incUUID, didLoadDoc := range current.IncludeRefs {
 		incRef := ds.included[incUUID]
+		if incRef == nil {
+			continue
+		}
 
 		incRef.IncludeCount--
 

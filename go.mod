@@ -29,7 +29,7 @@ require (
 	github.com/ttab/elephant-api v0.21.3
 	github.com/ttab/elephantine v0.24.0
 	github.com/ttab/langos v0.1.1
-	github.com/ttab/mage v0.9.0
+	github.com/ttab/mage v0.9.1
 	github.com/ttab/newsdoc v1.0.0
 	github.com/ttab/revisor v0.11.1
 	github.com/ttab/revisorschemas v1.2.0

@@ -281,6 +281,21 @@ func TestIntegrationBasicCrud(t *testing.T) {
 		EventUuid:       eventUUID,
 	}, deliverableInfo, "get expected deliverable info")
 
+	bulkInfo, err := client.BulkGetDeliverableInfo(ctx, &repository.BulkGetDeliverableInfoRequest{
+		Uuids: []string{docUUID, planningUUID},
+	})
+	test.Must(t, err, "bulk get deliverable info")
+	test.EqualMessage(t, &repository.BulkGetDeliverableInfoResponse{
+		Items: []*repository.DeliverableInfo{
+			{
+				Uuid:           docUUID,
+				PlanningUuid:   planningUUID,
+				AssignmentUuid: assignmentUUID,
+				EventUuid:      eventUUID,
+			},
+		},
+	}, bulkInfo, "get expected bulk deliverable info")
+
 	t0 := time.Now()
 
 	_, err = client.Delete(ctx, &repository.DeleteDocumentRequest{
@@ -571,8 +586,8 @@ func TestIntegrationDocumentLanguage(t *testing.T) {
 	})
 	test.Must(t, err, "update a document without a language")
 
-	// Doc + ACL
-	expectedEvents += 2
+	// Doc (ACL folded onto the document event).
+	expectedEvents++
 
 	enDoc := baseDocument(
 		"00668ca7-aca9-4e7e-8958-c67d48a3e0d2",
@@ -616,7 +631,8 @@ func TestIntegrationDocumentLanguage(t *testing.T) {
 	})
 	test.Must(t, err, "set version two as usable")
 
-	expectedEvents += 5
+	// Create (ACL folded in) + status + doc update + status = 4 events.
+	expectedEvents += 4
 
 	// Wait until the expected events have been registered.
 	_, err = client.Eventlog(ctx,
@@ -704,15 +720,28 @@ func TestDocumentsServiceMetaDocuments(t *testing.T) {
 	specPayload, err := json.Marshal(&spec)
 	test.Must(t, err, "marshal meta schema")
 
-	_, err = schema.Register(ctx, &repository.RegisterSchemaRequest{
-		Activate: true,
-		Schema: &repository.Schema{
-			Name:    "test/metadata",
-			Version: "v1.0.0",
-			Spec:    string(specPayload),
-		},
+	// Get all currently active schemas so we can include them in the new
+	// generation alongside the test schema.
+	activeSchemas, err := schema.GetAllActive(ctx,
+		&repository.GetAllActiveSchemasRequest{})
+	test.Must(t, err, "get active schemas")
+
+	genSchemas := make([]*repository.Schema, 0, len(activeSchemas.Schemas)+1)
+	genSchemas = append(genSchemas, activeSchemas.Schemas...)
+	genSchemas = append(genSchemas, &repository.Schema{
+		Name:    "test/metadata",
+		Version: "v1.0.0",
+		Spec:    string(specPayload),
 	})
-	test.Must(t, err, "register metadata schema")
+
+	_, err = schema.RegisterGeneration(ctx, &repository.RegisterGenerationRequest{
+		Activation: repository.SchemaActivation_ACTIVATION_ACTIVE,
+		Schemas:    genSchemas,
+	})
+	test.Must(t, err, "register metadata schema generation")
+
+	err = tc.Validator.RefreshSchemas(ctx)
+	test.Must(t, err, "refresh schemas after generation registration")
 
 	client := tc.DocumentsClient(t,
 		itest.StandardClaims(t, "doc_read doc_write doc_delete eventlog_read"))
@@ -1043,7 +1072,7 @@ func TestDocumentsServiceMetaDocuments(t *testing.T) {
 	})
 	isTwirpError(t, err, "get meta doc", twirp.NotFound, twirp.FailedPrecondition)
 
-	events := collectEventlog(t, client, 10, 4*time.Second)
+	events := collectEventlog(t, client, 8, 4*time.Second)
 
 	test.TestMessageAgainstGolden(t, regenerate, events,
 		filepath.Join(testData, "eventlog.json"),
@@ -1212,8 +1241,9 @@ func TestIntegrationBulkCrud(t *testing.T) {
 				Creator: testUserURI,
 			},
 		},
-		CreatorUri: "user://test/testintegrationbulkcrud",
-		UpdaterUri: "user://test/testintegrationbulkcrud",
+		CreatorUri:    "user://test/testintegrationbulkcrud",
+		UpdaterUri:    "user://test/testintegrationbulkcrud",
+		WorkflowState: "usable",
 	}
 
 	cmpDiffB := cmp.Diff(&wantMetaB, metaB.Meta,
@@ -1369,7 +1399,7 @@ func TestIntegrationStatus(t *testing.T) {
 		test.IgnoreTimestamps{})
 
 	// Check that we got the expected events.
-	events := collectEventlog(t, client, 31, 5*time.Second)
+	events := collectEventlog(t, client, 30, 5*time.Second)
 
 	eventsGolden := filepath.Join("testdata", t.Name(), "eventlog.json")
 
@@ -1772,6 +1802,109 @@ or Heads.approved_legal.Version == Status.Version`,
 		"should publish the second version now that legal has approved")
 }
 
+func TestIntegrationStatusRuleWorkflowState(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	ctx := t.Context()
+	logger := slog.New(test.NewLogHandler(t, slog.LevelInfo))
+	tc := testingAPIServer(t, logger, testingServerOptions{})
+
+	workflowClient := tc.WorkflowsClient(t,
+		itest.StandardClaims(t, "workflow_admin"))
+
+	_, err := workflowClient.SetWorkflow(ctx, &repository.SetWorkflowRequest{
+		Type: "core/article",
+		Workflow: &repository.DocumentWorkflow{
+			StepZero:           "draft",
+			Checkpoint:         "usable",
+			NegativeCheckpoint: "unpublished",
+			Steps:              []string{"draft", "done"},
+		},
+	})
+	test.Must(t, err, "create article workflow")
+
+	const ruleName = "unpublish-requires-prior-publish"
+
+	_, err = workflowClient.CreateStatusRule(ctx, &repository.CreateStatusRuleRequest{
+		Rule: &repository.StatusRule{
+			Type:        "core/article",
+			Name:        ruleName,
+			Description: "Unpublish is only allowed when previously published",
+			Expression: `Status.Version != -1
+or WorkflowState.LastCheckpoint == "usable"`,
+			AppliesTo: []string{"usable"},
+		},
+	})
+	test.Must(t, err, "create unpublish rule")
+
+	// Wait until the workflow provider picks up the rule.
+	t0 := time.Now()
+	workflowDeadline := time.After(2 * time.Second)
+
+	for {
+		if tc.WorkflowProvider.HasStatusRule("core/article", ruleName) {
+			t.Logf("had to wait %v for workflow update",
+				time.Since(t0))
+
+			break
+		}
+
+		select {
+		case <-workflowDeadline:
+			t.Fatal("workflow rule didn't propagate in time")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	client := tc.DocumentsClient(t,
+		itest.StandardClaims(t, "doc_read doc_write doc_delete"))
+
+	const (
+		docUUID = "ffa05627-be7a-4f09-8bfc-bc3361b0b0b5"
+		docURI  = "article://test/123"
+	)
+
+	doc := baseDocument(docUUID, docURI)
+
+	res, err := client.Update(ctx, &repository.UpdateRequest{
+		Uuid:     docUUID,
+		Document: doc,
+	})
+	test.Must(t, err, "create article")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid: docUUID,
+		Status: []*repository.StatusUpdate{
+			{Name: "usable", Version: -1},
+		},
+	})
+	test.MustNot(t, err,
+		"unpublish before publish should be blocked by workflow rule")
+
+	if !strings.Contains(err.Error(), ruleName) {
+		t.Fatalf("error message should mention %q, got: %s",
+			ruleName, err.Error())
+	}
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid: docUUID,
+		Status: []*repository.StatusUpdate{
+			{Name: "usable", Version: res.Version},
+		},
+	})
+	test.Must(t, err, "publish the document")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid: docUUID,
+		Status: []*repository.StatusUpdate{
+			{Name: "usable", Version: -1},
+		},
+	})
+	test.Must(t, err, "unpublish after publish is allowed")
+}
+
 func TestIntegrationACL(t *testing.T) {
 	if testing.Short() {
 		t.SkipNow()
@@ -2091,6 +2224,292 @@ func TestDocumentLocking(t *testing.T) {
 	test.Must(t, err, "unlock non-existing document")
 }
 
+func TestDocumentLockExclusivity(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	logger := slog.New(test.NewLogHandler(t, slog.LevelInfo))
+	ctx := t.Context()
+	tc := testingAPIServer(t, logger, testingServerOptions{})
+
+	client := tc.DocumentsClient(t,
+		itest.StandardClaims(t, "doc_read doc_write doc_delete"))
+
+	const (
+		docUUID = "3ec96c99-ed75-4a2c-bf4d-29892e6d7b7c"
+		docURI  = "article://test/lock-exclusivity"
+	)
+
+	doc := baseDocument(docUUID, docURI)
+
+	res, err := client.Update(ctx, &repository.UpdateRequest{
+		Uuid:     docUUID,
+		Document: doc,
+	})
+	test.Must(t, err, "create test article")
+
+	statusUpdate := []*repository.StatusUpdate{
+		{Name: "done", Version: res.Version},
+	}
+
+	aclUpdate := []*repository.ACLEntry{
+		{Uri: "user://test/other", Permissions: []string{"r"}},
+	}
+
+	// A default lock only blocks document updates.
+	lock, err := client.Lock(ctx, &repository.LockRequest{
+		Uuid: docUUID,
+		Ttl:  10000,
+	})
+	test.Must(t, err, "lock the document with default exclusivity")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:     docUUID,
+		Document: doc,
+	})
+	test.MustNot(t, err, "update a document with a default lock")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:   docUUID,
+		Status: statusUpdate,
+	})
+	test.Must(t, err, "set a status on a document with a default lock")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid: docUUID,
+		Acl:  aclUpdate,
+	})
+	test.Must(t, err, "update the ACL of a document with a default lock")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:      docUUID,
+		Status:    statusUpdate,
+		LockToken: "0e2e44ad-1a1c-4bc9-8a4a-44b35e3a0fcc",
+	})
+	test.MustNot(t, err, "set a status using the wrong lock token")
+
+	_, err = client.Unlock(ctx, &repository.UnlockRequest{
+		Uuid:  docUUID,
+		Token: lock.Token,
+	})
+	test.Must(t, err, "unlock the document")
+
+	// A status lock blocks status updates, but not ACL updates.
+	lock, err = client.Lock(ctx, &repository.LockRequest{
+		Uuid:        docUUID,
+		Ttl:         10000,
+		Exclusivity: repository.LockExclusivity_LOCK_STATUS,
+	})
+	test.Must(t, err, "lock the document with status exclusivity")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:   docUUID,
+		Status: statusUpdate,
+	})
+	test.MustNot(t, err, "set a status on a status-locked document")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid: docUUID,
+		Acl:  aclUpdate,
+	})
+	test.Must(t, err, "update the ACL of a status-locked document")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:      docUUID,
+		Status:    statusUpdate,
+		LockToken: lock.Token,
+	})
+	test.Must(t, err, "set a status on a status-locked document with the lock token")
+
+	_, err = client.Unlock(ctx, &repository.UnlockRequest{
+		Uuid:  docUUID,
+		Token: lock.Token,
+	})
+	test.Must(t, err, "unlock the document")
+
+	// An ACL lock blocks ACL updates, but not status updates.
+	lock, err = client.Lock(ctx, &repository.LockRequest{
+		Uuid:        docUUID,
+		Ttl:         10000,
+		Exclusivity: repository.LockExclusivity_LOCK_ACL,
+	})
+	test.Must(t, err, "lock the document with ACL exclusivity")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid: docUUID,
+		Acl:  aclUpdate,
+	})
+	test.MustNot(t, err, "update the ACL of an ACL-locked document")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:   docUUID,
+		Status: statusUpdate,
+	})
+	test.Must(t, err, "set a status on an ACL-locked document")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:      docUUID,
+		Acl:       aclUpdate,
+		LockToken: lock.Token,
+	})
+	test.Must(t, err, "update the ACL of an ACL-locked document with the lock token")
+
+	_, err = client.Unlock(ctx, &repository.UnlockRequest{
+		Uuid:  docUUID,
+		Token: lock.Token,
+	})
+	test.Must(t, err, "unlock the document")
+
+	// An exclusive lock blocks document, status, and ACL updates.
+	lock, err = client.Lock(ctx, &repository.LockRequest{
+		Uuid:        docUUID,
+		Ttl:         10000,
+		Exclusivity: repository.LockExclusivity_LOCK_EXCLUSIVE,
+	})
+	test.Must(t, err, "lock the document with exclusive exclusivity")
+
+	meta, err := client.GetMeta(ctx, &repository.GetMetaRequest{
+		Uuid: docUUID,
+	})
+	test.Must(t, err, "fetch document meta")
+	test.NotNil(t, meta.Meta.Lock, "document should have a lock")
+	test.Equal(t, meta.Meta.Lock.Exclusivity,
+		repository.LockExclusivity_LOCK_EXCLUSIVE,
+		"expected the lock exclusivity to be exposed in the meta")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:     docUUID,
+		Document: doc,
+	})
+	test.MustNot(t, err, "update an exclusively locked document")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:   docUUID,
+		Status: statusUpdate,
+	})
+	test.MustNot(t, err, "set a status on an exclusively locked document")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid: docUUID,
+		Acl:  aclUpdate,
+	})
+	test.MustNot(t, err, "update the ACL of an exclusively locked document")
+
+	_, err = client.Update(ctx, &repository.UpdateRequest{
+		Uuid:      docUUID,
+		Document:  doc,
+		Status:    statusUpdate,
+		Acl:       aclUpdate,
+		LockToken: lock.Token,
+	})
+	test.Must(t, err, "perform a full update of an exclusively locked document with the lock token")
+}
+
+func TestGetWithLock(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	logger := slog.New(test.NewLogHandler(t, slog.LevelInfo))
+	ctx := t.Context()
+	tc := testingAPIServer(t, logger, testingServerOptions{})
+
+	writeClient := tc.DocumentsClient(t,
+		itest.StandardClaims(t, "doc_read doc_write doc_delete"))
+
+	const (
+		docUUID = "1ae3b9b1-2c8e-4a7d-bd6a-3a2f3a2f3a2f"
+		docURI  = "article://test/get-with-lock"
+	)
+
+	_, err := writeClient.Update(ctx, &repository.UpdateRequest{
+		Uuid:     docUUID,
+		Document: baseDocument(docUUID, docURI),
+	})
+	test.Must(t, err, "create test article")
+
+	t.Run("acquires lock alongside get", func(t *testing.T) {
+		res, err := writeClient.Get(ctx, &repository.GetDocumentRequest{
+			Uuid: docUUID,
+			Lock: &repository.AcquireLock{
+				Ttl:     500,
+				App:     "test-app",
+				Comment: "while editing",
+			},
+		})
+		test.Must(t, err, "get with lock")
+		test.NotNil(t, res.Lock, "lock should be returned")
+		test.Equal(t, false, res.Lock.Token == "", "lock token should be set")
+		test.Equal(t, false, res.Lock.Expires == "", "lock expires should be set")
+
+		_, perr := time.Parse(time.RFC3339, res.Lock.Expires)
+		test.Must(t, perr, "expires is RFC3339")
+
+		meta, err := writeClient.GetMeta(ctx, &repository.GetMetaRequest{
+			Uuid: docUUID,
+		})
+		test.Must(t, err, "fetch document meta")
+		test.NotNil(t, meta.Meta.Lock, "lock should be visible on meta")
+		test.Equal(t, "test-app", meta.Meta.Lock.App, "app stored on lock")
+		test.Equal(t, "while editing", meta.Meta.Lock.Comment,
+			"comment stored on lock")
+		test.Equal(t, "user://test/testgetwithlock",
+			meta.Meta.Lock.Uri, "lock holder URI matches caller")
+	})
+
+	t.Run("conflict carries holder metadata", func(t *testing.T) {
+		// doc_admin bypasses ACL so the second user reaches the lock
+		// path and gets a real conflict instead of a permission error.
+		otherClient := tc.DocumentsClient(t,
+			itest.Claims(t, "other-user", "doc_admin"))
+
+		_, err := otherClient.Get(ctx, &repository.GetDocumentRequest{
+			Uuid: docUUID,
+			Lock: &repository.AcquireLock{
+				Ttl: 500,
+				App: "rival-app",
+			},
+		})
+
+		var twerr twirp.Error
+		if !errors.As(err, &twerr) {
+			t.Fatalf("expected twirp error, got %T: %v", err, err)
+		}
+
+		test.Equal(t, twirp.FailedPrecondition, twerr.Code(),
+			"conflict should be FailedPrecondition")
+		test.Equal(t, "user://test/testgetwithlock",
+			twerr.Meta("lock_holder_sub"),
+			"lock_holder_sub identifies the existing holder")
+		test.Equal(t, "test-app", twerr.Meta("lock_app"),
+			"lock_app exposed via metadata")
+	})
+
+	t.Run("missing ttl rejected", func(t *testing.T) {
+		_, err := writeClient.Get(ctx, &repository.GetDocumentRequest{
+			Uuid: docUUID,
+			Lock: &repository.AcquireLock{},
+		})
+		isTwirpError(t, err, "missing ttl",
+			twirp.InvalidArgument)
+	})
+
+	t.Run("read-only scope rejected", func(t *testing.T) {
+		readClient := tc.DocumentsClient(t,
+			itest.Claims(t, "reader", "doc_read"))
+
+		_, err := readClient.Get(ctx, &repository.GetDocumentRequest{
+			Uuid: docUUID,
+			Lock: &repository.AcquireLock{
+				Ttl: 500,
+			},
+		})
+		isTwirpError(t, err, "read-only client cannot acquire lock",
+			twirp.PermissionDenied)
+	})
+}
+
 func TestIntegrationStatsOverview(t *testing.T) {
 	if testing.Short() {
 		t.SkipNow()
@@ -2248,6 +2667,236 @@ func TestIntegrationStatsOverview(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPrune(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	logger := slog.New(test.NewLogHandler(t, slog.LevelInfo))
+
+	tc := testingAPIServer(t, logger, testingServerOptions{})
+
+	client := tc.DocumentsClient(t,
+		itest.StandardClaims(t, "doc_read doc_write"))
+
+	ctx := t.Context()
+
+	const (
+		docUUID = "ffa05627-be7a-4f09-8bfc-bc3361b0b0b5"
+		docURI  = "article://test/123"
+	)
+
+	t.Run("ValidDocument", func(t *testing.T) {
+		doc := baseDocument(docUUID, docURI)
+
+		res, err := client.Prune(ctx, &repository.PruneRequest{
+			Document: doc,
+		})
+		test.Must(t, err, "prune valid document")
+
+		test.Equal(t, 0, len(res.Errors),
+			"expected no errors for a valid document")
+
+		if res.Document == nil {
+			t.Fatal("expected pruned document to be returned")
+		}
+
+		test.Equal(t, docUUID, res.Document.Uuid,
+			"pruned document should have the same UUID")
+	})
+
+	t.Run("RemoveInvalidBlocks", func(t *testing.T) {
+		doc := baseDocument(docUUID, docURI)
+
+		doc.Meta = append(doc.Meta, &newsdoc.Block{
+			Type: "totally/invalid-block",
+		})
+
+		doc.Content = append(doc.Content, &newsdoc.Block{
+			Type: "not-a-real/content-block",
+			Data: map[string]string{
+				"text": "this should be pruned",
+			},
+		})
+
+		res, err := client.Prune(ctx, &repository.PruneRequest{
+			Document: doc,
+		})
+		test.Must(t, err, "prune document with invalid blocks")
+
+		test.Equal(t, 0, len(res.Errors),
+			"expected no errors after pruning invalid blocks")
+
+		if res.Document == nil {
+			t.Fatal("expected pruned document to be returned")
+		}
+
+		for _, m := range res.Document.Meta {
+			if m.Type == "totally/invalid-block" {
+				t.Error("invalid meta block should have been pruned")
+			}
+		}
+
+		for _, c := range res.Document.Content {
+			if c.Type == "not-a-real/content-block" {
+				t.Error("invalid content block should have been pruned")
+			}
+		}
+	})
+
+	t.Run("UndeclaredDocumentType", func(t *testing.T) {
+		doc := &newsdoc.Document{
+			Uuid:     docUUID,
+			Title:    "Unknown type",
+			Type:     "unknown/type",
+			Uri:      docURI,
+			Language: "en",
+		}
+
+		res, err := client.Prune(ctx, &repository.PruneRequest{
+			Document: doc,
+		})
+		test.Must(t, err, "prune document with undeclared type")
+
+		if len(res.Errors) == 0 {
+			t.Fatal("expected errors for undeclared document type")
+		}
+
+		if res.Document != nil {
+			t.Error("document should not be returned when there are errors")
+		}
+	})
+
+	t.Run("MissingDocument", func(t *testing.T) {
+		_, err := client.Prune(ctx, &repository.PruneRequest{})
+		if err == nil {
+			t.Fatal("expected error for missing document")
+		}
+
+		var twerr twirp.Error
+
+		if !errors.As(err, &twerr) {
+			t.Fatalf("expected twirp error, got %T", err)
+		}
+
+		test.Equal(t, twirp.InvalidArgument, twerr.Code(),
+			"expected invalid argument error code")
+	})
+}
+
+func TestPruneVariantType(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	t.Parallel()
+
+	logger := slog.New(test.NewLogHandler(t, slog.LevelError))
+
+	tc := testingAPIServer(t, logger, testingServerOptions{})
+
+	schemasClient := tc.SchemasClient(t,
+		itest.StandardClaims(t, "schema_admin"))
+
+	client := tc.DocumentsClient(t,
+		itest.StandardClaims(t, "doc_read doc_write"))
+
+	ctx := t.Context()
+
+	// Configure "timeless" as a valid variant for core/article.
+	_, err := schemasClient.ConfigureType(ctx,
+		&repository.ConfigureTypeRequest{
+			Type: "core/article",
+			Configuration: &repository.TypeConfiguration{
+				Variants: []string{"timeless"},
+			},
+		})
+	test.Must(t, err, "configure type variants")
+
+	const variantType = "core/article#timeless"
+
+	// Wait for the validator to pick up the variant configuration.
+	variantDoc := baseDocument(
+		"a1b2c3d4-1234-4f00-9abc-000000000001",
+		"article://test/variant-prune-1",
+	)
+	variantDoc.Type = variantType
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		_, err = client.Update(ctx, &repository.UpdateRequest{
+			Uuid:     variantDoc.Uuid,
+			Document: variantDoc,
+		})
+		if err == nil {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"timeout waiting for variant to be accepted: %v",
+				err)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Prune a valid variant document.
+	pruneDoc := baseDocument(
+		"a1b2c3d4-1234-4f00-9abc-000000000002",
+		"article://test/variant-prune-2",
+	)
+	pruneDoc.Type = variantType
+
+	res, err := client.Prune(ctx, &repository.PruneRequest{
+		Document: pruneDoc,
+	})
+	test.Must(t, err, "prune variant document")
+
+	test.Equal(t, 0, len(res.Errors),
+		"expected no errors for a valid variant document")
+
+	if res.Document == nil {
+		t.Fatal("expected pruned document to be returned")
+	}
+
+	test.Equal(t, variantType, res.Document.Type,
+		"pruned document should preserve the variant type")
+
+	// Prune a variant document with invalid blocks.
+	pruneDoc2 := baseDocument(
+		"a1b2c3d4-1234-4f00-9abc-000000000003",
+		"article://test/variant-prune-3",
+	)
+	pruneDoc2.Type = variantType
+
+	pruneDoc2.Content = append(pruneDoc2.Content, &newsdoc.Block{
+		Type: "not-a-real/content-block",
+		Data: map[string]string{
+			"text": "this should be pruned",
+		},
+	})
+
+	res, err = client.Prune(ctx, &repository.PruneRequest{
+		Document: pruneDoc2,
+	})
+	test.Must(t, err, "prune variant document with invalid blocks")
+
+	test.Equal(t, 0, len(res.Errors),
+		"expected no errors after pruning invalid blocks from variant document")
+
+	if res.Document == nil {
+		t.Fatal("expected pruned document to be returned")
+	}
+
+	for _, c := range res.Document.Content {
+		if c.Type == "not-a-real/content-block" {
+			t.Error("invalid content block should have been pruned")
+		}
 	}
 }
 

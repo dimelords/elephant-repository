@@ -40,7 +40,8 @@ type TestContext struct {
 
 	SigningKey       *ecdsa.PrivateKey
 	Server           *httptest.Server
-	WorkflowProvider repository.WorkflowProvider
+	Validator        *repository.Validator
+	WorkflowProvider *repository.Workflows
 	Documents        rpc.Documents
 	Schemas          rpc.Schemas
 	Workflows        rpc.Workflows
@@ -176,6 +177,11 @@ type testingServerOptions struct {
 	ConfigDirectory    string
 	Schemas            []eleconf.LoadedSchema
 	NoCoreSchemas      bool
+	EmitWorkflowEvent  bool
+	EmitACLEvent       bool
+	// EventlogStream overrides the eventlog stream config for the socket
+	// handler. A zero BufferSize defaults to 500.
+	EventlogStream repository.EventlogStreamConfig
 }
 
 func testingAPIServer(
@@ -222,6 +228,8 @@ func testingAPIServer(
 			DeleteTimeout:      1 * time.Second,
 			MetricsCalculators: inMet,
 			TypeConfigurations: typeConf,
+			EmitWorkflowEvent:  opts.EmitWorkflowEvent,
+			EmitACLEvent:       opts.EmitACLEvent,
 		})
 	test.Must(t, err, "create doc store")
 
@@ -347,7 +355,8 @@ func testingAPIServer(
 	socket, err := repository.NewSocketHandler(
 		ctx, logger, reg,
 		store, docCache, authParser, &socketKey.PublicKey,
-		[]string{"localhost", "example.ecms.se"})
+		[]string{"localhost", "example.ecms.se"},
+		opts.EventlogStream)
 	test.Must(t, err, "set up socket handler")
 
 	err = repository.SetUpRouter(router,
@@ -372,6 +381,7 @@ func testingAPIServer(
 		client:           client,
 		SigningKey:       jwtKey,
 		Server:           server,
+		Validator:        validator,
 		Documents:        docService,
 		Workflows:        workflowService,
 		Schemas:          schemaService,
@@ -389,7 +399,7 @@ func testingAPIServer(
 	schemas := opts.Schemas
 
 	if !opts.NoCoreSchemas {
-		core, err := repository.LoadEmbeddedSchemaSet("core", "core-metadoc", "core-planning")
+		core, err := repository.LoadEmbeddedSchemaSet("se.ecms", "se.ecms.metadoc", "se.ecms.planning")
 		test.Must(t, err, "load core schemas")
 
 		schemas = append(schemas, core...)
@@ -406,7 +416,11 @@ func testingAPIServer(
 			itest.StandardClaims(t, repository.ScopeMetricsAdmin)),
 	}
 
-	changes, err := eleconf.GetChanges(ctx, &clients, config, schemas)
+	err = repository.BootstrapGeneration(ctx, store)
+	test.Must(t, err, "bootstrap generation")
+
+	changes, err := eleconf.GetChanges(ctx, &clients, config, schemas,
+		nil, rpc.SchemaActivation_ACTIVATION_ACTIVE)
 	test.Must(t, err, "get changes")
 
 	for _, change := range changes {

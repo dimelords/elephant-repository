@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -31,11 +30,13 @@ import (
 	"github.com/ttab/elephantine"
 	"github.com/ttab/elephantine/pg"
 	"github.com/ttab/langos"
-	"github.com/ttab/revisor"
 	"github.com/twitchtv/twirp"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
 )
+
+var version string // set via -ldflags at build time
 
 func main() {
 	err := godotenv.Load()
@@ -88,10 +89,6 @@ func main() {
 				Sources: cli.EnvVars("DEFAULT_TIMEZONE"),
 				Value:   "Europe/Stockholm",
 			},
-			&cli.StringSliceFlag{
-				Name:    "ensure-schema",
-				Sources: cli.EnvVars("ENSURE_SCHEMA"),
-			},
 			//nolint:gosec // G101: Development default, not a real credential.
 			&cli.StringFlag{
 				Name:    "db",
@@ -143,11 +140,6 @@ func main() {
 				Sources: cli.EnvVars("TOLERATE_EVENTLOG_GAPS"),
 			},
 			&cli.BoolFlag{
-				Name:    "no-core-schema",
-				Usage:   "Don't register the built in core schema",
-				Sources: cli.EnvVars("NO_CORE_SCHEMA"),
-			},
-			&cli.BoolFlag{
 				Name:    "no-archiver",
 				Usage:   "Disable the archiver",
 				Sources: cli.EnvVars("NO_ARCHIVER"),
@@ -188,12 +180,46 @@ func main() {
 				Usage:   "CORS hosts to allow, supports wildcards",
 				Sources: cli.EnvVars("CORS_HOSTS"),
 			},
+			&cli.IntFlag{
+				Name:    "eventlog-buffer-size",
+				Value:   repository.DefaultEventlogBufferSize,
+				Usage:   "Number of recent eventlog events buffered for socket resume",
+				Sources: cli.EnvVars("EVENTLOG_BUFFER_SIZE"),
+			},
+			&cli.IntFlag{
+				Name:    "eventlog-stream-burst",
+				Value:   repository.DefaultEventlogStreamBurst,
+				Usage:   "Token-bucket burst for an eventlog subscription stream",
+				Sources: cli.EnvVars("EVENTLOG_STREAM_BURST"),
+			},
+			&cli.FloatFlag{
+				Name:    "eventlog-stream-rate",
+				Value:   float64(repository.DefaultEventlogStreamRate),
+				Usage:   "Token-bucket rate (events/sec) for an eventlog subscription stream",
+				Sources: cli.EnvVars("EVENTLOG_STREAM_RATE"),
+			},
 			&cli.BoolFlag{
 				Name: "migrate-db",
 				Usage: `Perform database migrations.
 Intended for bootstrapping disposable environments. Having this always on in
 production is a BAD IDEA! Migrations can be expensive and need to be planned.`,
 				Sources: cli.EnvVars("MIGRATE_DB"),
+			},
+			&cli.BoolFlag{
+				Name: "emit-workflow-event",
+				Usage: `Emit the legacy standalone "workflow" event alongside the
+workflow_state fields that are folded onto the triggering document or status
+event. Transition aid for external consumers; will be removed in a future
+release.`,
+				Sources: cli.EnvVars("EMIT_WORKFLOW_EVENT"),
+			},
+			&cli.BoolFlag{
+				Name: "emit-acl-event",
+				Usage: `Emit the legacy standalone "acl" event alongside the acl
+field that is folded onto the triggering document event. The folded field is
+always present; this flag only adds the extra event back. Transition aid for
+external consumers; will be removed in a future release.`,
+				Sources: cli.EnvVars("EMIT_ACL_EVENT"),
 			},
 		}, elephantine.AuthenticationCLIFlags()...),
 	}
@@ -215,20 +241,24 @@ production is a BAD IDEA! Migrations can be expensive and need to be planned.`,
 
 func runServer(ctx context.Context, c *cli.Command) error {
 	var (
-		addr            = c.String("addr")
-		tlsAddr         = c.String("tls-addr")
-		certFile        = c.String("cert-file")
-		keyFile         = c.String("key-file")
-		profileAddr     = c.String("profile-addr")
-		logLevel        = c.String("log-level")
-		ensureSchemas   = c.StringSlice("ensure-schema")
-		defaultLanguage = c.String("default-language")
-		defaultTimezone = c.String("default-timezone")
-		noCharCounter   = c.Bool("no-charcounter")
-		noWebsocket     = c.Bool("no-websocket")
-		noSSE           = c.Bool("no-sse")
-		corsHosts       = c.StringSlice("cors-host")
-		migrateDB       = c.Bool("migrate-db")
+		addr              = c.String("addr")
+		tlsAddr           = c.String("tls-addr")
+		certFile          = c.String("cert-file")
+		keyFile           = c.String("key-file")
+		profileAddr       = c.String("profile-addr")
+		logLevel          = c.String("log-level")
+		defaultLanguage   = c.String("default-language")
+		defaultTimezone   = c.String("default-timezone")
+		noCharCounter     = c.Bool("no-charcounter")
+		noWebsocket       = c.Bool("no-websocket")
+		noSSE             = c.Bool("no-sse")
+		corsHosts         = c.StringSlice("cors-host")
+		eventlogBufSize   = c.Int("eventlog-buffer-size")
+		eventlogBurst     = c.Int("eventlog-stream-burst")
+		eventlogRate      = c.Float("eventlog-stream-rate")
+		migrateDB         = c.Bool("migrate-db")
+		emitWorkflowEvent = c.Bool("emit-workflow-event")
+		emitACLEvent      = c.Bool("emit-acl-event")
 	)
 
 	logger := elephantine.SetUpLogger(logLevel, os.Stdout)
@@ -360,6 +390,8 @@ func runServer(ctx context.Context, c *cli.Command) error {
 			MetricsCalculators: inMet,
 			TypeConfigurations: typeConfs,
 			DefaultTZ:          defaultTZ,
+			EmitWorkflowEvent:  emitWorkflowEvent,
+			EmitACLEvent:       emitACLEvent,
 		})
 	if err != nil {
 		return fmt.Errorf("failed to create doc store: %w", err)
@@ -368,55 +400,19 @@ func runServer(ctx context.Context, c *cli.Command) error {
 	go store.RunListener(stopCtx, pubsubPool)
 	go store.RunCleaner(stopCtx, 5*time.Minute)
 
-	if !conf.NoCoreSchema {
-		err = repository.EnsureCoreSchema(ctx, store)
-		if err != nil {
-			return fmt.Errorf(
-				"failed to ensure core schema: %w", err)
-		}
+	bootstrapLock, err := pg.NewJobLock(
+		dbpool, logger, "bootstrap-generation",
+		pg.JobLockOptions{})
+	if err != nil {
+		return fmt.Errorf("create bootstrap generation lock: %w", err)
 	}
 
-	// Spec format name@version:URL
-	for _, spec := range ensureSchemas {
-		reference, rawURL, ok := strings.Cut(spec, ":")
-		if !ok {
-			return errors.New("expected a specification in the format name@version:URL")
-		}
-
-		name, version, ok := strings.Cut(reference, "@")
-		if !ok {
-			return errors.New("expected a specification in the format name@version:URL")
-		}
-
-		uri, err := url.Parse(rawURL)
-		if err != nil {
-			return fmt.Errorf("invalid URL for the schema %s: %w", name, err)
-		}
-
-		var schema revisor.ConstraintSet
-
-		switch uri.Scheme {
-		case "file":
-			err := elephantine.UnmarshalFile(uri.Opaque, &schema)
-			if err != nil {
-				return fmt.Errorf("failed to load the schema file for %s: %w",
-					name, err)
-			}
-		case "http", "https":
-			err := elephantine.UnmarshalHTTPResource(rawURL, &schema)
-			if err != nil {
-				return fmt.Errorf("failed to load the schema %s over HTTP(S): %w",
-					name, err)
-			}
-		default:
-			return fmt.Errorf("unknown schema URL scheme %q", uri.Scheme)
-		}
-
-		err = repository.EnsureSchema(ctx, store, name, version, schema)
-		if err != nil {
-			return fmt.Errorf(
-				"failed to ensure %s schema: %w", name, err)
-		}
+	err = bootstrapLock.RunWithContext(ctx,
+		func(ctx context.Context) error {
+			return repository.BootstrapGeneration(ctx, store)
+		})
+	if err != nil {
+		return fmt.Errorf("bootstrap schema generation: %w", err)
 	}
 
 	validator, err := repository.NewValidator(
@@ -624,6 +620,11 @@ func runServer(ctx context.Context, c *cli.Command) error {
 			grace.CancelOnQuit(ctx), logger, prometheus.DefaultRegisterer,
 			store, docCache, auth.AuthParser, &socketKey.PublicKey,
 			corsHosts,
+			repository.EventlogStreamConfig{
+				BufferSize: eventlogBufSize,
+				Rate:       rate.Limit(eventlogRate),
+				Burst:      eventlogBurst,
+			},
 		)
 		if err != nil {
 			return fmt.Errorf("set up socket handler: %w", err)
@@ -638,9 +639,31 @@ func runServer(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("failed to set up router: %w", err)
 	}
 
-	healthServer := elephantine.NewHealthServer(logger, profileAddr)
+	var serverOpts []elephantine.APIServerOption
 
-	healthServer.AddReadyFunction("s3", func(ctx context.Context) error {
+	serverOpts = append(serverOpts,
+		elephantine.APIServerVersion(version),
+		elephantine.APIServerModules(
+			"github.com/ttab/newsdoc",
+			"github.com/ttab/revisor",
+		))
+
+	if certFile != "" {
+		serverOpts = append(serverOpts,
+			elephantine.APIServerTLS(tlsAddr, certFile, keyFile))
+	}
+
+	srv := elephantine.NewAPIServer(logger, addr, profileAddr, serverOpts...)
+
+	if len(corsHosts) > 0 {
+		srv.CORS.Hosts = corsHosts
+	}
+
+	srv.CORS.AllowedHeaders = append(srv.CORS.AllowedHeaders, "Last-Event-ID")
+
+	srv.Mux.Handle("/", router)
+
+	srv.Health.AddReadyFunction("s3", func(ctx context.Context) error {
 		testUUID := uuid.New()
 
 		key := fmt.Sprintf(
@@ -678,52 +701,12 @@ func runServer(ctx context.Context, c *cli.Command) error {
 		return nil
 	})
 
-	healthServer.AddReadyFunction("postgres", func(ctx context.Context) error {
+	srv.Health.AddReadyFunction("postgres", func(ctx context.Context) error {
 		q := postgres.New(dbpool)
 
 		_, err := q.GetActiveSchemas(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to read schemas: %w", err)
-		}
-
-		return nil
-	})
-
-	router.GET("/health/alive", func(
-		w http.ResponseWriter, _ *http.Request, _ httprouter.Params,
-	) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-
-		_, _ = fmt.Fprintln(w, "I AM ALIVE!")
-	})
-
-	healthServer.AddReadyFunction("api_liveness", func(ctx context.Context) error {
-		req, err := http.NewRequestWithContext(
-			ctx, http.MethodGet, fmt.Sprintf(
-				"http://localhost%s/health/alive",
-				addr,
-			), nil,
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"failed to create liveness check request: %w", err)
-		}
-
-		var client http.Client
-
-		res, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf(
-				"failed to perform liveness check request: %w", err)
-		}
-
-		_ = res.Body.Close()
-
-		if res.StatusCode != http.StatusOK {
-			return fmt.Errorf(
-				"api liveness endpoint returned non-ok status: %s",
-				res.Status)
 		}
 
 		return nil
@@ -762,9 +745,7 @@ func runServer(ctx context.Context, c *cli.Command) error {
 	serverGroup.Go(func() error {
 		logger.Debug("starting API server")
 
-		err := repository.ListenAndServe(
-			gCtx, addr, tlsAddr,
-			router, corsHosts, certFile, keyFile)
+		err := srv.ListenAndServe(gCtx)
 		if err != nil {
 			return fmt.Errorf("API server error: %w", err)
 		}
@@ -785,17 +766,6 @@ func runServer(ctx context.Context, c *cli.Command) error {
 		}()
 
 		sseSubsystem.Run(gCtx)
-
-		return nil
-	})
-
-	serverGroup.Go(func() error {
-		logger.Debug("starting health server")
-
-		err := healthServer.ListenAndServe(gCtx)
-		if err != nil {
-			return fmt.Errorf("health server error: %w", err)
-		}
 
 		return nil
 	})

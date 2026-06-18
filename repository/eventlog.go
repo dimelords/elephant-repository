@@ -30,6 +30,20 @@ const (
 	TypeWorkflow        EventType = "workflow"
 )
 
+// Valid reports whether e is a known, emittable event type. The empty
+// TypeEventIgnored is not considered valid.
+func (e EventType) Valid() bool {
+	switch e {
+	case TypeDocumentVersion, TypeNewStatus, TypeACLUpdate,
+		TypeDeleteDocument, TypeRestoreFinished, TypeWorkflow:
+		return true
+	case TypeEventIgnored:
+		return false
+	default:
+		return false
+	}
+}
+
 type Event struct {
 	ID                 int64          `json:"id"`
 	Event              EventType      `json:"event"`
@@ -54,6 +68,7 @@ type Event struct {
 	DeleteRecordID     int64          `json:"delete_record_id,omitempty"`
 	Timespans          [][2]time.Time `json:"timespans,omitempty"`
 	Labels             []string       `json:"labels"`
+	SchemaGeneration   int64          `json:"schema_generation,omitempty"`
 }
 
 func NewEventlogBuilder(
@@ -155,11 +170,12 @@ func (eb *EventlogBuilder) Run(ctx context.Context) error {
 				WorkflowState:      pg.TextOrNull(evt.WorkflowStep),
 				WorkflowCheckpoint: pg.TextOrNull(evt.WorkflowCheckpoint),
 				Extra: &postgres.EventlogExtra{
-					AttachedObjects: evt.AttachedObjects,
-					DetachedObjects: evt.DetachedObjects,
-					DeleteRecordID:  evt.DeleteRecordID,
-					Timespans:       evt.Timespans,
-					Labels:          evt.Labels,
+					AttachedObjects:  evt.AttachedObjects,
+					DetachedObjects:  evt.DetachedObjects,
+					DeleteRecordID:   evt.DeleteRecordID,
+					Timespans:        evt.Timespans,
+					Labels:           evt.Labels,
+					SchemaGeneration: evt.SchemaGeneration,
 				},
 			}
 

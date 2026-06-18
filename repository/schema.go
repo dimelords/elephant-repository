@@ -6,31 +6,9 @@ import (
 	"io/fs"
 	"os"
 
-	"github.com/Masterminds/semver/v3"
 	"github.com/ttab/eleconf"
-	"github.com/ttab/revisor"
 	"github.com/ttab/revisorschemas"
 )
-
-func EnsureCoreSchema(ctx context.Context, store SchemaStore) error {
-	core, err := revisor.DecodeConstraintSetsFS(revisorschemas.Files(),
-		"core.json", "core-metadoc.json", "core-planning.json")
-	if err != nil {
-		return fmt.Errorf("invalid embedded core schemas: %w", err)
-	}
-
-	coreVersion := revisorschemas.Version()
-
-	for _, schema := range core {
-		err := EnsureSchema(ctx, store, schema.Name, coreVersion, schema)
-		if err != nil {
-			return fmt.Errorf("failed to ensure schema %q: %w",
-				schema.Name, err)
-		}
-	}
-
-	return nil
-}
 
 func LoadSchemasFromFS(
 	dir fs.FS, version string, names ...string,
@@ -70,47 +48,52 @@ func LoadEmbeddedSchemaSet(names ...string) ([]eleconf.LoadedSchema, error) {
 		names...)
 }
 
-func EnsureSchema(
-	ctx context.Context, store SchemaStore,
-	name string, version string, schema revisor.ConstraintSet,
-) error {
-	newVersion, err := semver.NewVersion(version)
+// BootstrapGeneration checks if an active schema generation exists and, if
+// not, creates one from the currently active schemas. This should be called
+// at startup under a job lock to handle the migration from per-schema
+// activation to generation-based activation.
+func BootstrapGeneration(ctx context.Context, store SchemaStore) error {
+	gen, err := store.GetActiveGeneration(ctx)
 	if err != nil {
-		return fmt.Errorf("invalid version: %w", err)
+		return fmt.Errorf("get active generation: %w", err)
 	}
 
-	versions, err := store.GetSchemaVersions(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to read current schema versions: %w", err)
+	if gen != nil {
+		return nil
 	}
 
-	currentVersion, ok := versions[name]
+	schemas, err := store.ListActiveSchemas(ctx)
+	if err != nil {
+		return fmt.Errorf("list active schemas: %w", err)
+	}
 
-	register := !ok
+	if len(schemas) == 0 {
+		return nil
+	}
 
-	if ok {
-		cV, err := semver.NewVersion(currentVersion)
-		if err != nil {
-			return fmt.Errorf("invalid version in database: %w", err)
+	// Load full specs for registration.
+	genSchemas := make([]RegisterGenerationSchema, 0, len(schemas))
+
+	for _, s := range schemas {
+		full, sErr := store.GetSchema(ctx, s.Name, s.Version)
+		if sErr != nil {
+			return fmt.Errorf("get schema %q v%s: %w",
+				s.Name, s.Version, sErr)
 		}
 
-		register = newVersion.GreaterThan(cV)
+		genSchemas = append(genSchemas, RegisterGenerationSchema{
+			Name:          full.Name,
+			Version:       full.Version,
+			Specification: full.Specification,
+		})
 	}
 
-	if !register {
-		return nil
-	}
-
-	err = store.RegisterSchema(ctx, RegisterSchemaRequest{
-		Name:          name,
-		Version:       version,
-		Activate:      true,
-		Specification: schema,
+	_, err = store.RegisterGeneration(ctx, RegisterGenerationStoreRequest{
+		Schemas:    genSchemas,
+		Activation: GenerationStatusActive,
 	})
-	if IsDocStoreErrorCode(err, ErrCodeExists) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("failed to register schema: %w", err)
+	if err != nil {
+		return fmt.Errorf("register bootstrap generation: %w", err)
 	}
 
 	return nil

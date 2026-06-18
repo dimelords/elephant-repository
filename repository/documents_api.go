@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"fmt"
 	"iter"
 	"maps"
@@ -28,6 +29,10 @@ type DocumentValidator interface {
 	ValidateDocument(
 		ctx context.Context, document *newsdoc.Document,
 	) ([]revisor.ValidationResult, error)
+	PruneDocument(
+		ctx context.Context, document *newsdoc.Document,
+	) ([]revisor.ValidationResult, error)
+	ActiveGenerationID() int64
 }
 
 type WorkflowProvider interface {
@@ -349,11 +354,12 @@ func DocumentMetaToRPC(meta *DocumentMeta) *repository.DocumentMeta {
 
 	if meta.Lock.Expires != (time.Time{}) {
 		resp.Lock = &repository.Lock{
-			Uri:     meta.Lock.URI,
-			Created: meta.Lock.Created.Format(time.RFC3339),
-			Expires: meta.Lock.Expires.Format(time.RFC3339),
-			App:     meta.Lock.App,
-			Comment: meta.Lock.Comment,
+			Uri:         meta.Lock.URI,
+			Created:     meta.Lock.Created.Format(time.RFC3339),
+			Expires:     meta.Lock.Expires.Format(time.RFC3339),
+			App:         meta.Lock.App,
+			Comment:     meta.Lock.Comment,
+			Exclusivity: lockExclusivityToRPC(meta.Lock.Exclusivity),
 		}
 	}
 
@@ -404,6 +410,92 @@ func (a *DocumentsService) GetDeliverableInfo(
 
 	if info.EventUUID != nil {
 		res.EventUuid = info.EventUUID.String()
+	}
+
+	return &res, nil
+}
+
+func (a *DocumentsService) BulkGetDeliverableInfo(
+	ctx context.Context, req *repository.BulkGetDeliverableInfoRequest,
+) (*repository.BulkGetDeliverableInfoResponse, error) {
+	auth, err := RequireAnyScope(ctx,
+		ScopeDocumentRead, ScopeDocumentReadAll, ScopeDocumentAdmin,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(req.Uuids) == 0 {
+		return nil, twirp.RequiredArgumentError("uuids")
+	}
+
+	if len(req.Uuids) > 200 {
+		return nil, twirp.InvalidArgumentError("uuids",
+			"limited to 200 documents")
+	}
+
+	uuids := make([]uuid.UUID, len(req.Uuids))
+
+	for i, raw := range req.Uuids {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return nil, twirp.InvalidArgument.Errorf(
+				"uuids: the %dnth UUID is invalid: %v", i, err)
+		}
+
+		uuids[i] = id
+	}
+
+	aclBypass := auth.Claims.HasAnyScope(
+		ScopeDocumentReadAll, ScopeDocumentAdmin)
+
+	if !aclBypass {
+		ident := append([]string{auth.Claims.Subject}, auth.Claims.Units...)
+
+		permitted, err := a.store.BulkCheckPermissions(ctx,
+			BulkCheckPermissionRequest{
+				UUIDs:       uuids,
+				GranteeURIs: ident,
+				Permissions: []Permission{ReadPermission},
+			})
+		if err != nil {
+			return nil, twirp.InternalErrorf("check ACL access: %v", err)
+		}
+
+		uuids = permitted
+	}
+
+	if len(uuids) == 0 {
+		return &repository.BulkGetDeliverableInfoResponse{}, nil
+	}
+
+	infos, err := a.store.BulkGetDeliverableInfo(ctx, uuids)
+	if err != nil {
+		return nil, twirp.InternalErrorf("load deliverable info: %v", err)
+	}
+
+	res := repository.BulkGetDeliverableInfoResponse{
+		Items: make([]*repository.DeliverableInfo, 0, len(infos)),
+	}
+
+	for _, info := range infos {
+		item := &repository.DeliverableInfo{
+			Uuid: info.UUID.String(),
+		}
+
+		if info.PlanningUUID != nil {
+			item.PlanningUuid = info.PlanningUUID.String()
+		}
+
+		if info.AssignmentUUID != nil {
+			item.AssignmentUuid = info.AssignmentUUID.String()
+		}
+
+		if info.EventUUID != nil {
+			item.EventUuid = info.EventUUID.String()
+		}
+
+		res.Items = append(res.Items, item)
 	}
 
 	return &res, nil
@@ -1054,6 +1146,7 @@ func EventToRPC(evt Event) *repository.EventlogItem {
 		DeleteRecordId:     evt.DeleteRecordID,
 		Timespans:          TimespanTuplesToRPC(evt.Timespans),
 		Labels:             evt.Labels,
+		SchemaGeneration:   evt.SchemaGeneration,
 	}
 }
 
@@ -1456,9 +1549,8 @@ func (a *DocumentsService) Get(
 			"cannot be a negative number")
 	}
 
-	if req.Lock {
-		return nil, twirp.Unimplemented.Error(
-			"locking is not implemented yet")
+	if req.Lock != nil && req.Lock.Ttl == 0 {
+		return nil, twirp.RequiredArgumentError("lock.ttl")
 	}
 
 	if req.Version > 0 && req.Status != "" {
@@ -1486,6 +1578,13 @@ func (a *DocumentsService) Get(
 		return nil, err
 	}
 
+	if req.Lock != nil {
+		err = a.accessCheck(ctx, auth, docUUID, WritePermission)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// TODO: This is a bit wasteful to request for all document loads.
 	meta, err := a.store.GetDocumentMeta(ctx, docUUID)
 	if IsDocStoreErrorCode(err, ErrCodeNotFound) {
@@ -1498,6 +1597,40 @@ func (a *DocumentsService) Get(
 	if meta.SystemLock != "" {
 		return nil, twirp.FailedPrecondition.Errorf(
 			"document is locked for %q", meta.SystemLock)
+	}
+
+	var lockGrant *repository.LockGrant
+
+	if req.Lock != nil {
+		exclusivity, err := lockExclusivityFromRPC(req.Lock.Exclusivity)
+		if err != nil {
+			return nil, twirp.InvalidArgumentError("lock.exclusivity", err.Error())
+		}
+
+		lock, err := a.store.Lock(ctx, LockRequest{
+			UUID:        docUUID,
+			TTL:         req.Lock.Ttl,
+			URI:         auth.Claims.Subject,
+			App:         req.Lock.App,
+			Comment:     req.Lock.Comment,
+			Exclusivity: exclusivity,
+		})
+
+		switch {
+		case IsDocStoreErrorCode(err, ErrCodeDeleteLock), IsDocStoreErrorCode(err, ErrCodeNotFound):
+			return nil, twirp.FailedPrecondition.Error("could not find the document")
+		case IsDocStoreErrorCode(err, ErrCodeBadRequest):
+			return nil, twirp.InvalidArgument.Error(err.Error())
+		case IsDocStoreErrorCode(err, ErrCodeDocumentLock):
+			return nil, lockConflictTwirp(err)
+		case err != nil:
+			return nil, fmt.Errorf("could not obtain lock: %w", err)
+		}
+
+		lockGrant = &repository.LockGrant{
+			Token:   lock.Token,
+			Expires: lock.Expires.Format(time.RFC3339),
+		}
 	}
 
 	var (
@@ -1544,6 +1677,7 @@ func (a *DocumentsService) Get(
 		Version:        version,
 		IsMetaDocument: meta.MainDocument != "",
 		MainDocument:   meta.MainDocument,
+		Lock:           lockGrant,
 	}
 
 	if req.MetaDocument != repository.GetMetaDoc_META_ONLY {
@@ -2115,6 +2249,8 @@ func (a *DocumentsService) buildUpdateRequest(
 			return nil, err
 		}
 
+		up.SchemaGeneration = a.validator.ActiveGenerationID()
+
 		up.Document = &doc
 
 		if isMetaURI(up.Document.URI) {
@@ -2525,6 +2661,38 @@ func (a *DocumentsService) Validate(
 	return &res, nil
 }
 
+// Prune implements repository.Documents.
+func (a *DocumentsService) Prune(
+	ctx context.Context, req *repository.PruneRequest,
+) (*repository.PruneResponse, error) {
+	if req.Document == nil {
+		return nil, twirp.RequiredArgumentError("document")
+	}
+
+	doc := rpcdoc.DocumentFromRPC(req.Document)
+
+	pruneResult, err := a.validator.PruneDocument(ctx, &doc)
+	if err != nil {
+		//nolint: wrapcheck
+		return nil, err
+	}
+
+	var res repository.PruneResponse
+
+	for _, r := range pruneResult {
+		res.Errors = append(res.Errors, &repository.ValidationResult{
+			Entity: EntityRefToRPC(r.Entity),
+			Error:  r.Error,
+		})
+	}
+
+	if len(res.Errors) == 0 {
+		res.Document = rpcdoc.DocumentToRPC(doc)
+	}
+
+	return &res, nil
+}
+
 func (a *DocumentsService) Lock(
 	ctx context.Context, req *repository.LockRequest,
 ) (*repository.LockResponse, error) {
@@ -2553,12 +2721,18 @@ func (a *DocumentsService) Lock(
 		return nil, twirp.RequiredArgumentError("ttl")
 	}
 
+	exclusivity, err := lockExclusivityFromRPC(req.Exclusivity)
+	if err != nil {
+		return nil, twirp.InvalidArgumentError("exclusivity", err.Error())
+	}
+
 	lock, err := a.store.Lock(ctx, LockRequest{
-		UUID:    docUUID,
-		TTL:     req.Ttl,
-		URI:     auth.Claims.Subject,
-		App:     req.App,
-		Comment: req.Comment,
+		UUID:        docUUID,
+		TTL:         req.Ttl,
+		URI:         auth.Claims.Subject,
+		App:         req.App,
+		Comment:     req.Comment,
+		Exclusivity: exclusivity,
 	})
 
 	switch {
@@ -2567,14 +2741,79 @@ func (a *DocumentsService) Lock(
 	case IsDocStoreErrorCode(err, ErrCodeBadRequest):
 		return nil, twirp.InvalidArgument.Error(err.Error())
 	case IsDocStoreErrorCode(err, ErrCodeDocumentLock):
-		return nil, twirp.FailedPrecondition.Error("the document is locked by someone else")
+		return nil, lockConflictTwirp(err)
 	case err != nil:
 		return nil, fmt.Errorf("could not obtain lock: %w", err)
 	}
 
 	return &repository.LockResponse{
-		Token: lock.Token,
+		Token:   lock.Token,
+		Expires: lock.Expires.Format(time.RFC3339),
 	}, nil
+}
+
+// lockConflictTwirp wraps a LockConflictError as a
+// twirp.FailedPrecondition error with metadata describing the
+// existing lock's holder. Clients compare lock_holder_sub against
+// their own subject to distinguish "I already hold this" from "held
+// by someone else".
+func lockConflictTwirp(err error) twirp.Error {
+	var conflict *LockConflictError
+	if !errors.As(err, &conflict) {
+		return twirp.FailedPrecondition.Error("the document is locked")
+	}
+
+	twerr := twirp.FailedPrecondition.Error("the document is locked").
+		WithMeta("lock_holder_sub", conflict.Holder.URI)
+
+	if conflict.Holder.App != "" {
+		twerr = twerr.WithMeta("lock_app", conflict.Holder.App)
+	}
+
+	if conflict.Holder.Comment != "" {
+		twerr = twerr.WithMeta("lock_comment", conflict.Holder.Comment)
+	}
+
+	if !conflict.Holder.Expires.IsZero() {
+		twerr = twerr.WithMeta("lock_expires", conflict.Holder.Expires.Format(time.RFC3339))
+	}
+
+	if conflict.Holder.Exclusivity != "" {
+		twerr = twerr.WithMeta("lock_exclusivity", string(conflict.Holder.Exclusivity))
+	}
+
+	return twerr
+}
+
+func lockExclusivityFromRPC(
+	e repository.LockExclusivity,
+) (LockExclusivity, error) {
+	switch e {
+	case repository.LockExclusivity_LOCK_DOCUMENT:
+		return LockExclusivityDocument, nil
+	case repository.LockExclusivity_LOCK_STATUS:
+		return LockExclusivityStatus, nil
+	case repository.LockExclusivity_LOCK_ACL:
+		return LockExclusivityACL, nil
+	case repository.LockExclusivity_LOCK_EXCLUSIVE:
+		return LockExclusivityExclusive, nil
+	}
+
+	return "", fmt.Errorf("unknown lock exclusivity value %d", e)
+}
+
+func lockExclusivityToRPC(e LockExclusivity) repository.LockExclusivity {
+	switch e {
+	case LockExclusivityStatus:
+		return repository.LockExclusivity_LOCK_STATUS
+	case LockExclusivityACL:
+		return repository.LockExclusivity_LOCK_ACL
+	case LockExclusivityExclusive:
+		return repository.LockExclusivity_LOCK_EXCLUSIVE
+	case LockExclusivityDocument:
+	}
+
+	return repository.LockExclusivity_LOCK_DOCUMENT
 }
 
 // ExtendLock extends the expiration of an existing lock.

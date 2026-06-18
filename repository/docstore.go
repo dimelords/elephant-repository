@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"crypto/ecdsa"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -128,6 +129,9 @@ type DocStore interface {
 	GetDeliverableInfo(
 		ctx context.Context, uuid uuid.UUID,
 	) (DeliverableInfo, error)
+	BulkGetDeliverableInfo(
+		ctx context.Context, uuids []uuid.UUID,
+	) ([]DeliverableInfo, error)
 	CreateUpload(ctx context.Context, upload Upload) error
 	GetAttachments(
 		ctx context.Context,
@@ -164,6 +168,7 @@ type TypeConfiguration struct {
 }
 
 type DeliverableInfo struct {
+	UUID            uuid.UUID
 	HasPlanningInfo bool
 	PlanningUUID    *uuid.UUID
 	AssignmentUUID  *uuid.UUID
@@ -237,6 +242,25 @@ type SchemaStore interface {
 	GetTypeConfigurations(
 		ctx context.Context,
 	) (map[string]TypeConfiguration, error)
+
+	// Generation management.
+	RegisterGeneration(
+		ctx context.Context, req RegisterGenerationStoreRequest,
+	) (int64, error)
+	SetGenerationStatus(
+		ctx context.Context, id int64, activation SchemaGenerationStatus,
+	) error
+	ListGenerations(
+		ctx context.Context, before int64,
+	) ([]SchemaGeneration, error)
+	GetExemplars(
+		ctx context.Context, generationID int64, known map[string]string,
+	) ([]ExemplarRecord, error)
+	GetActiveGeneration(ctx context.Context) (*SchemaGeneration, error)
+	GetActiveGenerationID(ctx context.Context) (int64, error)
+	GetPendingGeneration(ctx context.Context) (*SchemaGeneration, error)
+	GetActiveGenerationSchemas(ctx context.Context) ([]*Schema, error)
+	GetPendingGenerationSchemas(ctx context.Context) ([]*Schema, error)
 }
 
 type WorkflowStore interface {
@@ -324,9 +348,10 @@ func (wf DocumentWorkflow) Step(state WorkflowState, step WorkflowStep) Workflow
 	checkpoint := wf.Configuration.Checkpoint
 	negCheckpoint := wf.Configuration.NegativeCheckpoint
 
-	isCheckpoint := step.Status != nil && step.Status.Name == checkpoint
+	isCheckpoint := checkpoint != "" && step.Status != nil && step.Status.Name == checkpoint
 	isStep := step.Status != nil && slices.Contains(wf.Configuration.Steps, step.Status.Name)
-	atCheckpoint := state.Step == checkpoint || state.Step == negCheckpoint
+	atCheckpoint := (checkpoint != "" && state.Step == checkpoint) ||
+		(negCheckpoint != "" && state.Step == negCheckpoint)
 
 	// Creating a new version when at a checkpoint resets the step to zero.
 	if step.Version > 0 && atCheckpoint {
@@ -382,6 +407,62 @@ type RegisterSchemaRequest struct {
 	Activate      bool
 }
 
+// SchemaGenerationStatus represents the activation state of a generation.
+type SchemaGenerationStatus string
+
+const (
+	GenerationStatusActive      SchemaGenerationStatus = "active"
+	GenerationStatusPending     SchemaGenerationStatus = "pending"
+	GenerationStatusDeactivated SchemaGenerationStatus = "deactivated"
+)
+
+// SchemaGeneration is a numbered, immutable set of schema versions.
+type SchemaGeneration struct {
+	ID          int64
+	Status      SchemaGenerationStatus
+	Created     time.Time
+	Activated   *time.Time
+	Deactivated *time.Time
+	Schemas     []SchemaReference
+}
+
+// SchemaReference identifies a schema by name and version.
+type SchemaReference struct {
+	Name    string
+	Version string
+}
+
+// ExemplarRecord is a stored exemplar document for a generation.
+type ExemplarRecord struct {
+	Name        string
+	VersionHash string
+	DocType     string
+	Document    json.RawMessage
+}
+
+// RegisterGenerationSchema is a schema to include in a generation.
+type RegisterGenerationSchema struct {
+	Name          string
+	Version       string
+	Specification revisor.ConstraintSet
+}
+
+// ExemplarInput is an exemplar document to register with a generation.
+type ExemplarInput struct {
+	Name     string
+	DocType  string
+	Document json.RawMessage
+	Version  string
+}
+
+// RegisterGenerationStoreRequest is the store-layer request for registering
+// a schema generation.
+type RegisterGenerationStoreRequest struct {
+	Schemas    []RegisterGenerationSchema
+	Activation SchemaGenerationStatus
+	Exemplars  []ExemplarInput
+}
+
 type MetaTypeInfo struct {
 	Name   string
 	UsedBy []string
@@ -414,21 +495,22 @@ const (
 )
 
 type UpdateRequest struct {
-	UUID            uuid.UUID
-	Updated         time.Time
-	Updater         string
-	Meta            newsdoc.DataMap
-	ACL             []ACLEntry
-	DefaultACL      []ACLEntry
-	Status          []StatusUpdate
-	Document        *newsdoc.Document
-	MainDocument    *uuid.UUID
-	IfMatch         int64
-	LockToken       string
-	IfWorkflowState string
-	IfStatusHeads   map[string]int64
-	AttachObjects   map[string]Upload
-	DetachObjects   []string
+	UUID             uuid.UUID
+	Updated          time.Time
+	Updater          string
+	Meta             newsdoc.DataMap
+	ACL              []ACLEntry
+	DefaultACL       []ACLEntry
+	Status           []StatusUpdate
+	Document         *newsdoc.Document
+	MainDocument     *uuid.UUID
+	IfMatch          int64
+	LockToken        string
+	IfWorkflowState  string
+	IfStatusHeads    map[string]int64
+	AttachObjects    map[string]Upload
+	DetachObjects    []string
+	SchemaGeneration int64
 }
 
 type DeleteRequest struct {
@@ -491,26 +573,62 @@ type ACLEntry struct {
 }
 
 type Lock struct {
-	Token   string
-	URI     string
-	Created time.Time
-	Expires time.Time
-	App     string
-	Comment string
+	Token       string
+	URI         string
+	Created     time.Time
+	Expires     time.Time
+	App         string
+	Comment     string
+	Exclusivity LockExclusivity
 }
 
+// LockExclusivity controls which operations a document lock blocks for
+// callers that don't hold the lock token. Document updates are always
+// blocked by a lock; the exclusivity level can extend the lock to also
+// cover status and ACL updates.
+type LockExclusivity string
+
+const (
+	// LockExclusivityDocument blocks document updates only.
+	LockExclusivityDocument LockExclusivity = "document"
+	// LockExclusivityStatus blocks document and status updates.
+	LockExclusivityStatus LockExclusivity = "status"
+	// LockExclusivityACL blocks document and ACL updates.
+	LockExclusivityACL LockExclusivity = "acl"
+	// LockExclusivityExclusive blocks document, status, and ACL updates.
+	LockExclusivityExclusive LockExclusivity = "exclusive"
+)
+
 type LockRequest struct {
-	UUID    uuid.UUID
-	URI     string
-	TTL     int32
-	App     string
-	Comment string
+	UUID        uuid.UUID
+	URI         string
+	TTL         int32
+	App         string
+	Comment     string
+	Exclusivity LockExclusivity
 }
 
 type LockResult struct {
 	Token   string
 	Created time.Time
 	Expires time.Time
+}
+
+// LockConflictError is returned by Lock when the document is already
+// locked. It carries the existing lock's holder info so handlers can
+// surface useful diagnostics — typically as twirp error metadata.
+//
+// Embeds DocStoreError so IsDocStoreErrorCode(err, ErrCodeDocumentLock)
+// continues to work.
+type LockConflictError struct {
+	DocStoreError
+	Holder Lock
+}
+
+// Unwrap exposes the embedded DocStoreError so errors.As walks down
+// to it when callers ask for a DocStoreError specifically.
+func (e *LockConflictError) Unwrap() error {
+	return e.DocStoreError
 }
 
 type UpdateLockRequest struct {

@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.26.1-alpine3.23 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine3.23 AS build
 
 WORKDIR /usr/src
 
@@ -8,8 +8,11 @@ RUN go mod download && go mod verify
 ADD . ./
 
 ARG TARGETOS TARGETARCH
+ARG VERSION=v0.0.0-dev
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -o /build/repository ./cmd/repository
+    go build \
+      -ldflags "-X main.version=$VERSION" \
+      -o /build/repository ./cmd/repository
 
 FROM alpine:3.23
 
